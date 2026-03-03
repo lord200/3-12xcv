@@ -16,26 +16,18 @@ from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQu
 
 static_ffmpeg.add_paths()
 load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN")
 
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN environment variable is missing.")
 
 DOWNLOAD_DIR = "./downloads"
 LOGS_DIR = "./logs"
+COOKIES_FILE = "./cookies.txt"
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 os.makedirs(LOGS_DIR, exist_ok=True)
-# Write cookies from env variable to a file for yt-dlp
-COOKIES_FILE = "./cookies.txt"
-cookies_content = os.getenv("TIKTOK_COOKIES")
-if cookies_content:
-    with open(COOKIES_FILE, "w", encoding="utf-8") as f:
-        f.write(cookies_content)
-    logger.info("✅ Cookies file written from environment variable")
-else:
-    COOKIES_FILE = None
-    logger.warning("⚠️ No TIKTOK_COOKIES env var found — age-restricted videos may fail")
+
 # ──────────────────────────────────────────────
 # LOGGING SETUP
 # ──────────────────────────────────────────────
@@ -70,10 +62,20 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 # ──────────────────────────────────────────────
 
+# Write cookies from environment variable to file
+cookies_content = os.getenv("TIKTOK_COOKIES")
+if cookies_content:
+    with open(COOKIES_FILE, "w", encoding="utf-8") as f:
+        f.write(cookies_content)
+    logger.info("✅ Cookies file written from environment variable")
+else:
+    COOKIES_FILE = None
+    logger.warning("⚠️ No TIKTOK_COOKIES env var found — age-restricted videos may fail")
+
 # Temporary store: maps user_id -> tiktok_url
 pending_urls: dict[int, str] = {}
 
-# Common yt-dlp options with browser headers to avoid TikTok blocks
+# Common yt-dlp options
 YTDLP_COMMON_OPTS = {
     "quiet": True,
     "http_headers": {
@@ -167,10 +169,13 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         video_id = None
 
-        # --- Get video info first (needed for audio-only to get video_id) ---
+        # --- Get video info first ---
+        logger.debug(f"[INFO] Fetching metadata for {user} | URL: {url}")
         with yt_dlp.YoutubeDL({**YTDLP_COMMON_OPTS}) as ydl:
             info = ydl.extract_info(url, download=False)
             video_id = info["id"]
+
+        logger.debug(f"[INFO] Got video_id={video_id} | title={info.get('title', 'N/A')}")
 
         # --- Download Video ---
         if choice in ("download_video", "download_both"):
@@ -183,10 +188,10 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             with yt_dlp.YoutubeDL(video_opts) as ydl:
                 ydl.extract_info(url, download=True)
                 video_file = ydl.prepare_filename(info).replace(
-                    info.get("ext", ""), "mp4"
+                    f".{info.get('ext', 'mp4')}", ".mp4"
                 )
 
-            # Fallback: find actual video file if prepare_filename is off
+            # Fallback: glob if prepare_filename path is off
             if not os.path.exists(video_file):
                 matches = glob.glob(os.path.join(DOWNLOAD_DIR, f"{video_id}_video.*"))
                 video_file = matches[0] if matches else None
@@ -213,7 +218,7 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             with yt_dlp.YoutubeDL(audio_opts) as ydl:
                 ydl.extract_info(url, download=True)
 
-            # Find the actual MP3 (extension changes after post-processing)
+            # Find actual MP3 (extension changes after post-processing)
             matches = glob.glob(os.path.join(DOWNLOAD_DIR, f"{video_id}_audio.*"))
             audio_file = next((f for f in matches if f.endswith(".mp3")), None)
 
@@ -272,6 +277,7 @@ def main():
     logger.info("🤖 TikTok Bot starting up...")
     logger.info(f"📁 Downloads dir : {os.path.abspath(DOWNLOAD_DIR)}")
     logger.info(f"📋 Logs dir      : {os.path.abspath(LOGS_DIR)}")
+    logger.info(f"🍪 Cookies       : {'enabled' if COOKIES_FILE else 'disabled'}")
     logger.info("=" * 50)
 
     app = Application.builder().token(BOT_TOKEN).build()
@@ -285,4 +291,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
