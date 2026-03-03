@@ -3,11 +3,13 @@ import glob
 import logging
 import logging.handlers
 from datetime import datetime
+import static_ffmpeg
 from dotenv import load_dotenv
 import yt_dlp
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
+static_ffmpeg.add_paths()  # ← makes ffmpeg available to yt-dlp
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
@@ -203,4 +205,5 @@ def main():
 
 
 if __name__ == "__main__":
+
     main()
