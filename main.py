@@ -2,7 +2,12 @@ import os
 import glob
 import logging
 import logging.handlers
+import subprocess
 from datetime import datetime
+
+# Auto-update yt-dlp on every startup
+subprocess.run(["pip", "install", "--upgrade", "yt-dlp"], capture_output=True)
+
 import static_ffmpeg
 from dotenv import load_dotenv
 import yt_dlp
@@ -59,9 +64,22 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 # Temporary store: maps user_id -> tiktok_url
 pending_urls: dict[int, str] = {}
 
+# Common yt-dlp options with browser headers to avoid TikTok blocks
+YTDLP_COMMON_OPTS = {
+    "quiet": True,
+    "http_headers": {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": "https://www.tiktok.com/",
+    },
+}
+
 
 def is_tiktok_url(url: str) -> bool:
-    return "tiktok.com" in url or "vm.tiktok.com" in url
+    return any(domain in url for domain in [
+        "tiktok.com",
+        "vm.tiktok.com",
+        "vt.tiktok.com",
+    ])
 
 
 def get_user_info(update: Update) -> str:
@@ -122,45 +140,58 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ Session expired. Please send the TikTok link again.")
         return
 
-    label = {"download_video": "🎬 Video", "download_audio": "🎵 Audio", "download_both": "📦 Both"}[choice]
-    logger.info(f"[CHOICE] User {user} chose: {label} | URL: {url}")
+    label = {
+        "download_video": "🎬 Video",
+        "download_audio": "🎵 Audio",
+        "download_both": "📦 Both"
+    }[choice]
 
+    logger.info(f"[CHOICE] User {user} chose: {label} | URL: {url}")
     await query.edit_message_text(f"⏳ Downloading {label}... please wait.")
 
     video_file = None
     audio_file = None
+    info = None
     start_time = datetime.now()
 
     try:
         video_id = None
 
+        # --- Get video info first (needed for audio-only to get video_id) ---
+        with yt_dlp.YoutubeDL({**YTDLP_COMMON_OPTS}) as ydl:
+            info = ydl.extract_info(url, download=False)
+            video_id = info["id"]
+
         # --- Download Video ---
         if choice in ("download_video", "download_both"):
-            logger.debug(f"[DOWNLOAD] Video for {user}")
+            logger.debug(f"[DOWNLOAD] Video for {user} | id={video_id}")
             video_opts = {
+                **YTDLP_COMMON_OPTS,
                 "outtmpl": os.path.join(DOWNLOAD_DIR, "%(id)s_video.%(ext)s"),
-                "format": "mp4",
-                "quiet": True,
+                "format": "mp4/bestvideo+bestaudio/best",
             }
             with yt_dlp.YoutubeDL(video_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                video_id = info["id"]
-                video_file = ydl.prepare_filename(info)
+                ydl.extract_info(url, download=True)
+                video_file = ydl.prepare_filename(info).replace(
+                    info.get("ext", ""), "mp4"
+                )
+
+            # Fallback: find actual video file if prepare_filename is off
+            if not os.path.exists(video_file):
+                matches = glob.glob(os.path.join(DOWNLOAD_DIR, f"{video_id}_video.*"))
+                video_file = matches[0] if matches else None
+
+            if not video_file or not os.path.exists(video_file):
+                raise FileNotFoundError("Video file not found after download.")
 
             video_size_mb = os.path.getsize(video_file) / (1024 * 1024)
             logger.info(f"[VIDEO OK] id={video_id} | size={video_size_mb:.2f}MB | user={user}")
 
         # --- Download Audio ---
         if choice in ("download_audio", "download_both"):
-            logger.debug(f"[DOWNLOAD] Audio for {user}")
-
-            # If video wasn't downloaded, we still need the video_id
-            if not video_id:
-                with yt_dlp.YoutubeDL({"quiet": True}) as ydl:
-                    info = ydl.extract_info(url, download=False)
-                    video_id = info["id"]
-
+            logger.debug(f"[DOWNLOAD] Audio for {user} | id={video_id}")
             audio_opts = {
+                **YTDLP_COMMON_OPTS,
                 "outtmpl": os.path.join(DOWNLOAD_DIR, f"{video_id}_audio.%(ext)s"),
                 "format": "bestaudio/best",
                 "postprocessors": [{
@@ -168,11 +199,11 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "preferredcodec": "mp3",
                     "preferredquality": "192",
                 }],
-                "quiet": True,
             }
             with yt_dlp.YoutubeDL(audio_opts) as ydl:
                 ydl.extract_info(url, download=True)
 
+            # Find the actual MP3 (extension changes after post-processing)
             matches = glob.glob(os.path.join(DOWNLOAD_DIR, f"{video_id}_audio.*"))
             audio_file = next((f for f in matches if f.endswith(".mp3")), None)
 
@@ -185,7 +216,7 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("✅ Done! Sending your file(s)...")
 
         # --- Send Video ---
-        if video_file:
+        if video_file and os.path.exists(video_file):
             logger.debug(f"[SEND] Sending video to {user}")
             with open(video_file, "rb") as vf:
                 await query.message.reply_video(
@@ -195,7 +226,7 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
 
         # --- Send Audio ---
-        if audio_file:
+        if audio_file and os.path.exists(audio_file):
             logger.debug(f"[SEND] Sending audio to {user}")
             with open(audio_file, "rb") as af:
                 await query.message.reply_audio(
@@ -210,7 +241,7 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except FileNotFoundError as e:
         logger.error(f"[FILE ERROR] User={user} | Error={e}", exc_info=True)
-        await query.edit_message_text("❌ Failed: could not find the converted audio file.")
+        await query.edit_message_text(f"❌ Failed: {str(e)}")
 
     except Exception as e:
         logger.error(f"[FAILED] User={user} | URL={url} | Error={e}", exc_info=True)
