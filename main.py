@@ -26,7 +26,16 @@ LOGS_DIR = "./logs"
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 os.makedirs(LOGS_DIR, exist_ok=True)
-
+# Write cookies from env variable to a file for yt-dlp
+COOKIES_FILE = "./cookies.txt"
+cookies_content = os.getenv("TIKTOK_COOKIES")
+if cookies_content:
+    with open(COOKIES_FILE, "w", encoding="utf-8") as f:
+        f.write(cookies_content)
+    logger.info("✅ Cookies file written from environment variable")
+else:
+    COOKIES_FILE = None
+    logger.warning("⚠️ No TIKTOK_COOKIES env var found — age-restricted videos may fail")
 # ──────────────────────────────────────────────
 # LOGGING SETUP
 # ──────────────────────────────────────────────
@@ -71,6 +80,7 @@ YTDLP_COMMON_OPTS = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Referer": "https://www.tiktok.com/",
     },
+    **({"cookiefile": COOKIES_FILE} if COOKIES_FILE else {}),
 }
 
 
@@ -275,3 +285,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
