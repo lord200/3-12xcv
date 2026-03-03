@@ -35,7 +35,7 @@ os.makedirs(LOGS_DIR, exist_ok=True)
 LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
 DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
-logger = logging.getLogger("TikTokBot")
+logger = logging.getLogger("DownloaderBot")
 logger.setLevel(logging.DEBUG)
 
 console_handler = logging.StreamHandler()
@@ -71,7 +71,7 @@ if tiktok_cookies:
     logger.info("✅ TikTok cookies loaded")
 else:
     TIKTOK_COOKIES_FILE = None
-    logger.warning("⚠️ No TIKTOK_COOKIES env var — age-restricted TikToks may fail")
+    logger.warning("⚠️ No TIKTOK_COOKIES — age-restricted TikToks may fail")
 
 # Write Instagram cookies from env var
 instagram_cookies = os.getenv("INSTAGRAM_COOKIES")
@@ -81,45 +81,70 @@ if instagram_cookies:
     logger.info("✅ Instagram cookies loaded")
 else:
     INSTAGRAM_COOKIES_FILE = None
-    logger.warning("⚠️ No INSTAGRAM_COOKIES env var — private Instagram content may fail")
+    logger.warning("⚠️ No INSTAGRAM_COOKIES — private Instagram content may fail")
 
 # Temporary store: maps user_id -> url
 pending_urls: dict[int, str] = {}
 
 
 # ──────────────────────────────────────────────
-# URL DETECTION
+# PLATFORM DETECTION
 # ──────────────────────────────────────────────
 def detect_platform(url: str) -> str | None:
-    """Returns 'tiktok', 'instagram', or None."""
+    """Returns 'tiktok', 'instagram', 'youtube', or None."""
     if any(d in url for d in ["tiktok.com", "vm.tiktok.com", "vt.tiktok.com"]):
         return "tiktok"
     if any(d in url for d in ["instagram.com", "instagr.am"]):
         return "instagram"
+    if any(d in url for d in ["youtube.com", "youtu.be", "youtube-nocookie.com"]):
+        return "youtube"
     return None
 
 
 def get_ydlp_opts(platform: str) -> dict:
-    """Return yt-dlp base options depending on platform."""
+    """Return yt-dlp base options per platform."""
+    base = {"quiet": True}
+
     if platform == "tiktok":
         return {
-            "quiet": True,
+            **base,
             "http_headers": {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 "Referer": "https://www.tiktok.com/",
             },
             **({"cookiefile": TIKTOK_COOKIES_FILE} if TIKTOK_COOKIES_FILE else {}),
         }
-    elif platform == "instagram":
+
+    if platform == "instagram":
         return {
-            "quiet": True,
+            **base,
             "http_headers": {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 "Referer": "https://www.instagram.com/",
             },
             **({"cookiefile": INSTAGRAM_COOKIES_FILE} if INSTAGRAM_COOKIES_FILE else {}),
         }
-    return {"quiet": True}
+
+    if platform == "youtube":
+        return {
+            **base,
+            "http_headers": {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            },
+        }
+
+    return base
+
+
+PLATFORM_EMOJI = {
+    "tiktok": "🎵",
+    "instagram": "📸",
+    "youtube": "▶️",
+}
+
+# YouTube only supports audio download (MP3)
+# TikTok and Instagram support video + audio + both
+YOUTUBE_ONLY_AUDIO = True
 
 
 # ──────────────────────────────────────────────
@@ -130,12 +155,6 @@ def get_user_info(update: Update) -> str:
     return f"@{user.username}" if user.username else f"id:{user.id}"
 
 
-PLATFORM_EMOJI = {
-    "tiktok": "🎵",
-    "instagram": "📸",
-}
-
-
 # ──────────────────────────────────────────────
 # HANDLERS
 # ──────────────────────────────────────────────
@@ -143,10 +162,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user_info(update)
     logger.info(f"[START] User {user} started the bot")
     await update.message.reply_text(
-        "👋 Welcome! Send me a link and I'll download it for you.\n\n"
+        "👋 Welcome! Send me a link and I'll download it.\n\n"
         "✅ Supported platforms:\n"
-        "🎵 TikTok (videos & audio)\n"
-        "📸 Instagram Reels & posts\n\n"
+        "🎵 TikTok — video & audio\n"
+        "📸 Instagram — Reels & posts\n"
+        "▶️ YouTube — MP3 audio only\n\n"
         "Just paste any link!"
     )
 
@@ -156,34 +176,45 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user_info(update)
     user_id = update.effective_user.id
 
-    logger.info(f"[REQUEST] User {user} sent URL: {url}")
+    logger.info(f"[REQUEST] User {user} | URL: {url}")
 
     platform = detect_platform(url)
     if not platform:
-        logger.warning(f"[INVALID URL] User {user} sent unsupported URL: {url}")
+        logger.warning(f"[INVALID URL] User {user} | URL: {url}")
         await update.message.reply_text(
             "❌ Unsupported link.\n\n"
-            "Please send a TikTok or Instagram Reel link."
+            "Supported: TikTok, Instagram Reels, YouTube"
         )
         return
 
     pending_urls[user_id] = url
     emoji = PLATFORM_EMOJI[platform]
 
-    keyboard = [
-        [
-            InlineKeyboardButton("🎬 Video", callback_data="download_video"),
-            InlineKeyboardButton("🎵 Audio (MP3)", callback_data="download_audio"),
-        ],
-        [
-            InlineKeyboardButton("📦 Both", callback_data="download_both"),
+    # YouTube only supports audio
+    if platform == "youtube":
+        keyboard = [
+            [InlineKeyboardButton("🎵 Download MP3", callback_data="download_audio")]
         ]
-    ]
-
-    await update.message.reply_text(
-        f"{emoji} {platform.capitalize()} link detected!\nWhat do you want to download?",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+        await update.message.reply_text(
+            f"{emoji} YouTube link detected!\n"
+            "YouTube only supports MP3 audio download.",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    else:
+        keyboard = [
+            [
+                InlineKeyboardButton("🎬 Video", callback_data="download_video"),
+                InlineKeyboardButton("🎵 Audio (MP3)", callback_data="download_audio"),
+            ],
+            [
+                InlineKeyboardButton("📦 Both", callback_data="download_both"),
+            ]
+        ]
+        await update.message.reply_text(
+            f"{emoji} {platform.capitalize()} link detected!\n"
+            "What do you want to download?",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
 
 
 async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -208,7 +239,7 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "download_both": "📦 Both"
     }[choice]
 
-    logger.info(f"[CHOICE] User {user} chose: {label} | Platform: {platform} | URL: {url}")
+    logger.info(f"[CHOICE] User {user} | {label} | platform={platform} | URL: {url}")
     await query.edit_message_text(f"⏳ Downloading {label}... please wait.")
 
     video_file = None
@@ -222,8 +253,16 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with yt_dlp.YoutubeDL({**base_opts}) as ydl:
             info = ydl.extract_info(url, download=False)
             video_id = info["id"]
+            title = info.get("title", "Unknown")
+            uploader = info.get("uploader") or info.get("channel") or platform.capitalize()
+            duration_sec = info.get("duration", 0)
 
-        logger.debug(f"[INFO] video_id={video_id} | title={info.get('title', 'N/A')}")
+        logger.debug(f"[INFO] id={video_id} | title={title} | duration={duration_sec}s")
+
+        # YouTube: block video downloads
+        if platform == "youtube" and choice in ("download_video", "download_both"):
+            await query.edit_message_text("⚠️ YouTube only supports MP3 audio download.")
+            return
 
         # --- Download Video ---
         if choice in ("download_video", "download_both"):
@@ -284,7 +323,7 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             with open(video_file, "rb") as vf:
                 await query.message.reply_video(
                     video=vf,
-                    caption=f"🎬 *{info.get('title', 'Video')}*",
+                    caption=f"🎬 *{title}*",
                     parse_mode="Markdown"
                 )
 
@@ -294,20 +333,21 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             with open(audio_file, "rb") as af:
                 await query.message.reply_audio(
                     audio=af,
-                    title=info.get("title", "Audio"),
-                    performer=info.get("uploader", platform.capitalize()),
+                    title=title,
+                    performer=uploader,
+                    duration=duration_sec,
                     caption="🎵 Audio (MP3)"
                 )
 
         elapsed = (datetime.now() - start_time).seconds
-        logger.info(f"[SUCCESS] {label} → {user} | took={elapsed}s")
+        logger.info(f"[SUCCESS] {label} → {user} | platform={platform} | took={elapsed}s")
 
     except FileNotFoundError as e:
         logger.error(f"[FILE ERROR] User={user} | {e}", exc_info=True)
         await query.edit_message_text(f"❌ Failed: {str(e)}")
 
     except Exception as e:
-        logger.error(f"[FAILED] User={user} | URL={url} | {e}", exc_info=True)
+        logger.error(f"[FAILED] User={user} | platform={platform} | URL={url} | {e}", exc_info=True)
         await query.edit_message_text(f"❌ Failed to download.\nError: {str(e)}")
 
     finally:
@@ -325,11 +365,12 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ──────────────────────────────────────────────
 def main():
     logger.info("=" * 50)
-    logger.info("🤖 Bot starting up...")
-    logger.info(f"📁 Downloads     : {os.path.abspath(DOWNLOAD_DIR)}")
-    logger.info(f"📋 Logs          : {os.path.abspath(LOGS_DIR)}")
-    logger.info(f"🍪 TikTok cookies: {'enabled' if TIKTOK_COOKIES_FILE else 'disabled'}")
-    logger.info(f"🍪 IG cookies    : {'enabled' if INSTAGRAM_COOKIES_FILE else 'disabled'}")
+    logger.info("🤖 Downloader Bot starting up...")
+    logger.info(f"📁 Downloads        : {os.path.abspath(DOWNLOAD_DIR)}")
+    logger.info(f"📋 Logs             : {os.path.abspath(LOGS_DIR)}")
+    logger.info(f"🍪 TikTok cookies   : {'enabled' if TIKTOK_COOKIES_FILE else 'disabled'}")
+    logger.info(f"🍪 Instagram cookies: {'enabled' if INSTAGRAM_COOKIES_FILE else 'disabled'}")
+    logger.info("▶️  YouTube          : MP3 audio only")
     logger.info("=" * 50)
 
     app = Application.builder().token(BOT_TOKEN).build()
