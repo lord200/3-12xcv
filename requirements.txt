@@ -1,3 +1,4 @@
 python-telegram-bot==21.10
 yt-dlp==2025.2.19
 python-dotenv==1.0.1
+static-ffmpeg==2.5
