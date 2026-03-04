@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 import yt_dlp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+from telegram.constants import ChatAction
 
 static_ffmpeg.add_paths()
 load_dotenv()
@@ -83,65 +84,44 @@ else:
     INSTAGRAM_COOKIES_FILE = None
     logger.warning("⚠️ No INSTAGRAM_COOKIES — private Instagram content may fail")
 
-# Temporary store: maps user_id -> url
+# Temporary stores
 pending_urls: dict[int, str] = {}
+pending_info: dict[int, dict] = {}  # stores pre-fetched yt-dlp info per user
 
 
 # ──────────────────────────────────────────────
 # FRIENDLY ERROR PARSER
 # ──────────────────────────────────────────────
 def parse_friendly_error(error: Exception, platform: str) -> str:
-    """
-    Convert raw yt-dlp errors into clean user-friendly messages.
-    """
     msg = str(error).lower()
 
-    # Private / login required
-    if any(k in msg for k in [
-        "private", "login", "log in", "authentication",
-        "not comfortable", "this post may not be", "sign in"
-    ]):
+    if any(k in msg for k in ["private", "login", "log in", "authentication",
+                               "not comfortable", "this post may not be", "sign in"]):
         return (
             "🔒 This content is *private* or requires a login to access.\n\n"
             "Make sure your cookies are up to date."
         )
-
-    # Geo-blocked
     if any(k in msg for k in ["not available in your country", "geo", "blocked in"]):
         return "🌍 This content is *not available* in the server's region (geo-blocked)."
-
-    # Deleted / not found
     if any(k in msg for k in ["removed", "deleted", "no longer available", "does not exist", "404", "not found"]):
         return "🗑️ This content has been *deleted* or no longer exists."
-
-    # Copyright / taken down
     if any(k in msg for k in ["copyright", "terms of service", "violated"]):
         return "⚠️ This content was *taken down* due to copyright or Terms of Service."
-
-    # Age restricted
     if any(k in msg for k in ["age", "18+", "adult", "mature"]):
         return (
             "🔞 This content is *age-restricted*.\n\n"
             "Add your cookies to the bot to access it."
         )
-
-    # No formats found (TikTok specific)
     if any(k in msg for k in ["no video formats", "no formats found"]):
         return (
-            "📭 No downloadable formats were found for this video.\n\n"
-            "This usually means the video is private, deleted, or TikTok blocked the request.\n"
+            "📭 No downloadable formats were found.\n\n"
+            "The content may be private, deleted, or temporarily blocked.\n"
             "Try again in a moment."
         )
-
-    # Too large for Telegram
     if any(k in msg for k in ["too large", "file size", "maximum"]):
         return "📦 This file is *too large* to send via Telegram (50MB limit)."
-
-    # Network / timeout
     if any(k in msg for k in ["timeout", "connection", "network", "ssl", "http error"]):
         return "🌐 A *network error* occurred. Please try again."
-
-    # YouTube specific
     if platform == "youtube":
         if "video unavailable" in msg:
             return "❌ This YouTube video is *unavailable* (private, deleted, or region-locked)."
@@ -149,13 +129,10 @@ def parse_friendly_error(error: Exception, platform: str) -> str:
             return "👥 This is a *members-only* YouTube video and cannot be downloaded."
         if "premiere" in msg:
             return "🎬 This YouTube video is a *Premiere* and hasn't aired yet."
-
-    # Instagram specific
     if platform == "instagram":
         if "story" in msg:
             return "📖 Instagram *Stories* are not supported."
 
-    # Generic fallback — don't expose raw error
     return (
         f"❌ Failed to download this {platform.capitalize()} content.\n\n"
         "Possible reasons: the content is private, deleted, or temporarily unavailable.\n"
@@ -178,7 +155,6 @@ def detect_platform(url: str) -> str | None:
 
 def get_ydlp_opts(platform: str) -> dict:
     base = {"quiet": True}
-
     if platform == "tiktok":
         return {
             **base,
@@ -188,7 +164,6 @@ def get_ydlp_opts(platform: str) -> dict:
             },
             **({"cookiefile": TIKTOK_COOKIES_FILE} if TIKTOK_COOKIES_FILE else {}),
         }
-
     if platform == "instagram":
         return {
             **base,
@@ -198,7 +173,6 @@ def get_ydlp_opts(platform: str) -> dict:
             },
             **({"cookiefile": INSTAGRAM_COOKIES_FILE} if INSTAGRAM_COOKIES_FILE else {}),
         }
-
     if platform == "youtube":
         return {
             **base,
@@ -206,8 +180,29 @@ def get_ydlp_opts(platform: str) -> dict:
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             },
         }
-
     return base
+
+
+def is_tiktok_slideshow(info: dict) -> bool:
+    """Detect if a TikTok is a photo slideshow instead of a video."""
+    # TikTok slideshows have images in the 'images' key or entries with image formats
+    if info.get("images"):
+        return True
+    formats = info.get("formats", [])
+    # If all formats are images (no video stream), it's a slideshow
+    if formats and all(
+        f.get("vcodec") == "none" and f.get("ext") in ("jpg", "jpeg", "png", "webp")
+        for f in formats if f.get("ext") in ("jpg", "jpeg", "png", "webp")
+    ):
+        return True
+    # Check _type or direct image URLs
+    if info.get("_type") == "playlist" and info.get("entries"):
+        entries = info["entries"]
+        if entries and all(
+            e.get("ext") in ("jpg", "jpeg", "png", "webp") for e in entries if e
+        ):
+            return True
+    return False
 
 
 PLATFORM_EMOJI = {
@@ -217,9 +212,6 @@ PLATFORM_EMOJI = {
 }
 
 
-# ──────────────────────────────────────────────
-# HELPERS
-# ──────────────────────────────────────────────
 def get_user_info(update: Update) -> str:
     user = update.effective_user
     return f"@{user.username}" if user.username else f"id:{user.id}"
@@ -233,8 +225,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"[START] User {user} started the bot")
     await update.message.reply_text(
         "👋 Welcome! Send me a link and I'll download it.\n\n"
-        "✅ Supported platforms:\n"
-        "🎵 TikTok — video & audio\n"
+        "✅ Supported:\n"
+        "🎵 TikTok — video, audio & photo slideshows\n"
         "📸 Instagram — Reels & posts\n"
         "▶️ YouTube — MP3 audio only\n\n"
         "Just paste any link!"
@@ -252,38 +244,74 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not platform:
         logger.warning(f"[INVALID URL] User {user} | URL: {url}")
         await update.message.reply_text(
-            "❌ Unsupported link.\n\n"
-            "Supported: TikTok, Instagram Reels, YouTube"
+            "❌ Unsupported link.\n\nSupported: TikTok, Instagram Reels, YouTube"
         )
         return
 
-    pending_urls[user_id] = url
-    emoji = PLATFORM_EMOJI[platform]
+    # Show typing indicator while we fetch metadata
+    await update.message.chat.send_action(ChatAction.TYPING)
 
-    if platform == "youtube":
-        keyboard = [
-            [InlineKeyboardButton("🎵 Download MP3", callback_data="download_audio")]
-        ]
-        await update.message.reply_text(
-            f"{emoji} YouTube link detected!\n"
-            "YouTube only supports MP3 audio download.",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-    else:
-        keyboard = [
-            [
-                InlineKeyboardButton("🎬 Video", callback_data="download_video"),
-                InlineKeyboardButton("🎵 Audio (MP3)", callback_data="download_audio"),
-            ],
-            [
-                InlineKeyboardButton("📦 Both", callback_data="download_both"),
+    try:
+        base_opts = get_ydlp_opts(platform)
+        with yt_dlp.YoutubeDL({**base_opts}) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+        # Cache info and url for callback use
+        pending_urls[user_id] = url
+        pending_info[user_id] = info
+
+        emoji = PLATFORM_EMOJI[platform]
+
+        # ── TikTok slideshow detected ──
+        if platform == "tiktok" and is_tiktok_slideshow(info):
+            photo_count = len(info.get("images", [])) or len(info.get("entries", [])) or "?"
+            logger.info(f"[SLIDESHOW] Detected TikTok slideshow | photos={photo_count} | user={user}")
+            keyboard = [
+                [
+                    InlineKeyboardButton(f"🖼️ Photos ({photo_count})", callback_data="download_photos"),
+                    InlineKeyboardButton("🎵 Audio (MP3)", callback_data="download_audio"),
+                ],
+                [
+                    InlineKeyboardButton("📦 Photos + Audio", callback_data="download_photos_audio"),
+                ]
             ]
-        ]
-        await update.message.reply_text(
-            f"{emoji} {platform.capitalize()} link detected!\n"
-            "What do you want to download?",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
+            await update.message.reply_text(
+                f"🖼️ TikTok *photo slideshow* detected! ({photo_count} photos)\n\n"
+                "How do you want to download it?",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode="Markdown"
+            )
+
+        # ── YouTube ──
+        elif platform == "youtube":
+            keyboard = [
+                [InlineKeyboardButton("🎵 Download MP3", callback_data="download_audio")]
+            ]
+            await update.message.reply_text(
+                f"{emoji} YouTube link detected!\nYouTube only supports MP3 audio download.",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+
+        # ── TikTok video / Instagram ──
+        else:
+            keyboard = [
+                [
+                    InlineKeyboardButton("🎬 Video", callback_data="download_video"),
+                    InlineKeyboardButton("🎵 Audio (MP3)", callback_data="download_audio"),
+                ],
+                [
+                    InlineKeyboardButton("📦 Both", callback_data="download_both"),
+                ]
+            ]
+            await update.message.reply_text(
+                f"{emoji} {platform.capitalize()} link detected!\nWhat do you want to download?",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+
+    except Exception as e:
+        logger.error(f"[METADATA ERROR] User={user} | URL={url} | {e}", exc_info=True)
+        friendly = parse_friendly_error(e, platform)
+        await update.message.reply_text(friendly, parse_mode="Markdown")
 
 
 async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -295,46 +323,101 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     choice = query.data
 
     url = pending_urls.pop(user_id, None)
-    if not url:
+    info = pending_info.pop(user_id, None)
+
+    if not url or not info:
         await query.edit_message_text("❌ Session expired. Please send the link again.")
         return
 
     platform = detect_platform(url)
     base_opts = get_ydlp_opts(platform)
+    video_id = info["id"]
+    title = info.get("title", "Unknown")
+    uploader = info.get("uploader") or info.get("channel") or platform.capitalize()
+    duration_sec = info.get("duration", 0)
 
     label = {
         "download_video": "🎬 Video",
         "download_audio": "🎵 Audio",
-        "download_both": "📦 Both"
+        "download_both": "📦 Both",
+        "download_photos": "🖼️ Photos",
+        "download_photos_audio": "🖼️ Photos + Audio",
     }[choice]
 
-    logger.info(f"[CHOICE] User {user} | {label} | platform={platform} | URL: {url}")
+    logger.info(f"[CHOICE] User {user} | {label} | platform={platform}")
     await query.edit_message_text(f"⏳ Downloading {label}... please wait.")
 
     video_file = None
     audio_file = None
-    info = None
+    photo_files = []
     start_time = datetime.now()
 
     try:
-        # --- Fetch metadata ---
-        logger.debug(f"[INFO] Fetching metadata | platform={platform} | user={user}")
-        with yt_dlp.YoutubeDL({**base_opts}) as ydl:
-            info = ydl.extract_info(url, download=False)
-            video_id = info["id"]
-            title = info.get("title", "Unknown")
-            uploader = info.get("uploader") or info.get("channel") or platform.capitalize()
-            duration_sec = info.get("duration", 0)
+        # ── SLIDESHOW: Download photos ──
+        if choice in ("download_photos", "download_photos_audio"):
+            logger.debug(f"[DOWNLOAD] Slideshow photos | id={video_id} | user={user}")
 
-        logger.debug(f"[INFO] id={video_id} | title={title} | duration={duration_sec}s")
+            photo_dir = os.path.join(DOWNLOAD_DIR, video_id)
+            os.makedirs(photo_dir, exist_ok=True)
 
-        # YouTube: block video downloads
-        if platform == "youtube" and choice in ("download_video", "download_both"):
-            await query.edit_message_text("⚠️ YouTube only supports MP3 audio download.")
-            return
+            photo_opts = {
+                **base_opts,
+                "outtmpl": os.path.join(photo_dir, "%(autonumber)s.%(ext)s"),
+                "format": "mhtml/best",          # TikTok slideshow format
+                "write_pages": False,
+            }
 
-        # --- Download Video ---
+            # yt-dlp stores slideshow images in info["images"]
+            images = info.get("images", [])
+            if images:
+                import urllib.request
+                for i, img in enumerate(images):
+                    img_url = img.get("url") if isinstance(img, dict) else img
+                    if img_url:
+                        ext = "jpg"
+                        dest = os.path.join(photo_dir, f"{i+1:03d}.{ext}")
+                        urllib.request.urlretrieve(img_url, dest)
+                        if os.path.exists(dest):
+                            photo_files.append(dest)
+            else:
+                # Fallback: let yt-dlp download them
+                with yt_dlp.YoutubeDL(photo_opts) as ydl:
+                    ydl.extract_info(url, download=True)
+                photo_files = sorted(glob.glob(os.path.join(photo_dir, "*.*")))
+                photo_files = [f for f in photo_files if f.lower().endswith((".jpg", ".jpeg", ".png", ".webp"))]
+
+            logger.info(f"[PHOTOS OK] id={video_id} | count={len(photo_files)} | user={user}")
+
+        # ── Download Audio ──
+        if choice in ("download_audio", "download_both", "download_photos_audio"):
+            logger.debug(f"[DOWNLOAD] Audio | id={video_id} | user={user}")
+            audio_opts = {
+                **base_opts,
+                "outtmpl": os.path.join(DOWNLOAD_DIR, f"{video_id}_audio.%(ext)s"),
+                "format": "bestaudio/best",
+                "postprocessors": [{
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "192",
+                }],
+            }
+            with yt_dlp.YoutubeDL(audio_opts) as ydl:
+                ydl.extract_info(url, download=True)
+
+            matches = glob.glob(os.path.join(DOWNLOAD_DIR, f"{video_id}_audio.*"))
+            audio_file = next((f for f in matches if f.endswith(".mp3")), None)
+            if not audio_file:
+                raise FileNotFoundError("MP3 file not found after conversion.")
+
+            audio_size_mb = os.path.getsize(audio_file) / (1024 * 1024)
+            logger.info(f"[AUDIO OK] id={video_id} | size={audio_size_mb:.2f}MB | user={user}")
+
+        # ── Download Video ──
         if choice in ("download_video", "download_both"):
+            if platform == "youtube":
+                await query.edit_message_text("⚠️ YouTube only supports MP3 audio download.")
+                return
+
             logger.debug(f"[DOWNLOAD] Video | id={video_id} | user={user}")
             video_opts = {
                 **base_opts,
@@ -358,34 +441,31 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             video_size_mb = os.path.getsize(video_file) / (1024 * 1024)
             logger.info(f"[VIDEO OK] id={video_id} | size={video_size_mb:.2f}MB | user={user}")
 
-        # --- Download Audio ---
-        if choice in ("download_audio", "download_both"):
-            logger.debug(f"[DOWNLOAD] Audio | id={video_id} | user={user}")
-            audio_opts = {
-                **base_opts,
-                "outtmpl": os.path.join(DOWNLOAD_DIR, f"{video_id}_audio.%(ext)s"),
-                "format": "bestaudio/best",
-                "postprocessors": [{
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "192",
-                }],
-            }
-            with yt_dlp.YoutubeDL(audio_opts) as ydl:
-                ydl.extract_info(url, download=True)
-
-            matches = glob.glob(os.path.join(DOWNLOAD_DIR, f"{video_id}_audio.*"))
-            audio_file = next((f for f in matches if f.endswith(".mp3")), None)
-
-            if not audio_file:
-                raise FileNotFoundError("MP3 file not found after conversion.")
-
-            audio_size_mb = os.path.getsize(audio_file) / (1024 * 1024)
-            logger.info(f"[AUDIO OK] id={video_id} | size={audio_size_mb:.2f}MB | user={user}")
-
         await query.edit_message_text("✅ Done! Sending your file(s)...")
 
-        # --- Send Video ---
+        # ── Send Photos as media group ──
+        if photo_files:
+            logger.debug(f"[SEND] {len(photo_files)} photos → {user}")
+            from telegram import InputMediaPhoto
+
+            # Telegram allows max 10 per media group
+            CHUNK_SIZE = 10
+            for i in range(0, len(photo_files), CHUNK_SIZE):
+                chunk = photo_files[i:i + CHUNK_SIZE]
+                media_group = []
+                handles = []
+                for j, path in enumerate(chunk):
+                    fh = open(path, "rb")
+                    handles.append(fh)
+                    caption = f"🖼️ *{title}* ({i+j+1}/{len(photo_files)})" if j == 0 else None
+                    media_group.append(InputMediaPhoto(media=fh, caption=caption, parse_mode="Markdown"))
+
+                await query.message.reply_media_group(media=media_group)
+
+                for fh in handles:
+                    fh.close()
+
+        # ── Send Video ──
         if video_file and os.path.exists(video_file):
             logger.debug(f"[SEND] Video → {user}")
             with open(video_file, "rb") as vf:
@@ -395,7 +475,7 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="Markdown"
                 )
 
-        # --- Send Audio ---
+        # ── Send Audio ──
         if audio_file and os.path.exists(audio_file):
             logger.debug(f"[SEND] Audio → {user}")
             with open(audio_file, "rb") as af:
@@ -412,22 +492,31 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except FileNotFoundError as e:
         logger.error(f"[FILE ERROR] User={user} | {e}", exc_info=True)
-        friendly = parse_friendly_error(e, platform)
-        await query.edit_message_text(friendly, parse_mode="Markdown")
+        await query.edit_message_text(parse_friendly_error(e, platform), parse_mode="Markdown")
 
     except Exception as e:
         logger.error(f"[FAILED] User={user} | platform={platform} | URL={url} | {e}", exc_info=True)
-        friendly = parse_friendly_error(e, platform)
-        await query.edit_message_text(friendly, parse_mode="Markdown")
+        await query.edit_message_text(parse_friendly_error(e, platform), parse_mode="Markdown")
 
     finally:
-        cleaned = []
+        # Cleanup single files
         for f in [video_file, audio_file]:
             if f and os.path.exists(f):
                 os.remove(f)
-                cleaned.append(f)
-        if cleaned:
-            logger.debug(f"[CLEANUP] Removed: {cleaned}")
+
+        # Cleanup photo directory
+        if photo_files:
+            photo_dir = os.path.join(DOWNLOAD_DIR, video_id)
+            for f in photo_files:
+                if os.path.exists(f):
+                    os.remove(f)
+            if os.path.exists(photo_dir):
+                try:
+                    os.rmdir(photo_dir)
+                except OSError:
+                    pass
+
+        logger.debug(f"[CLEANUP] Done for id={video_id}")
 
 
 # ──────────────────────────────────────────────
