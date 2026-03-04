@@ -88,10 +88,85 @@ pending_urls: dict[int, str] = {}
 
 
 # ──────────────────────────────────────────────
+# FRIENDLY ERROR PARSER
+# ──────────────────────────────────────────────
+def parse_friendly_error(error: Exception, platform: str) -> str:
+    """
+    Convert raw yt-dlp errors into clean user-friendly messages.
+    """
+    msg = str(error).lower()
+
+    # Private / login required
+    if any(k in msg for k in [
+        "private", "login", "log in", "authentication",
+        "not comfortable", "this post may not be", "sign in"
+    ]):
+        return (
+            "🔒 This content is *private* or requires a login to access.\n\n"
+            "Make sure your cookies are up to date."
+        )
+
+    # Geo-blocked
+    if any(k in msg for k in ["not available in your country", "geo", "blocked in"]):
+        return "🌍 This content is *not available* in the server's region (geo-blocked)."
+
+    # Deleted / not found
+    if any(k in msg for k in ["removed", "deleted", "no longer available", "does not exist", "404", "not found"]):
+        return "🗑️ This content has been *deleted* or no longer exists."
+
+    # Copyright / taken down
+    if any(k in msg for k in ["copyright", "terms of service", "violated"]):
+        return "⚠️ This content was *taken down* due to copyright or Terms of Service."
+
+    # Age restricted
+    if any(k in msg for k in ["age", "18+", "adult", "mature"]):
+        return (
+            "🔞 This content is *age-restricted*.\n\n"
+            "Add your cookies to the bot to access it."
+        )
+
+    # No formats found (TikTok specific)
+    if any(k in msg for k in ["no video formats", "no formats found"]):
+        return (
+            "📭 No downloadable formats were found for this video.\n\n"
+            "This usually means the video is private, deleted, or TikTok blocked the request.\n"
+            "Try again in a moment."
+        )
+
+    # Too large for Telegram
+    if any(k in msg for k in ["too large", "file size", "maximum"]):
+        return "📦 This file is *too large* to send via Telegram (50MB limit)."
+
+    # Network / timeout
+    if any(k in msg for k in ["timeout", "connection", "network", "ssl", "http error"]):
+        return "🌐 A *network error* occurred. Please try again."
+
+    # YouTube specific
+    if platform == "youtube":
+        if "video unavailable" in msg:
+            return "❌ This YouTube video is *unavailable* (private, deleted, or region-locked)."
+        if "members only" in msg:
+            return "👥 This is a *members-only* YouTube video and cannot be downloaded."
+        if "premiere" in msg:
+            return "🎬 This YouTube video is a *Premiere* and hasn't aired yet."
+
+    # Instagram specific
+    if platform == "instagram":
+        if "story" in msg:
+            return "📖 Instagram *Stories* are not supported."
+
+    # Generic fallback — don't expose raw error
+    return (
+        f"❌ Failed to download this {platform.capitalize()} content.\n\n"
+        "Possible reasons: the content is private, deleted, or temporarily unavailable.\n"
+        "Please try again later."
+    )
+
+
+# ──────────────────────────────────────────────
 # PLATFORM DETECTION
 # ──────────────────────────────────────────────
 def detect_platform(url: str) -> str | None:
-    """Returns 'tiktok', 'instagram', 'youtube', or None."""
     if any(d in url for d in ["tiktok.com", "vm.tiktok.com", "vt.tiktok.com"]):
         return "tiktok"
     if any(d in url for d in ["instagram.com", "instagr.am"]):
@@ -102,7 +177,6 @@ def detect_platform(url: str) -> str | None:
 
 
 def get_ydlp_opts(platform: str) -> dict:
-    """Return yt-dlp base options per platform."""
     base = {"quiet": True}
 
     if platform == "tiktok":
@@ -141,10 +215,6 @@ PLATFORM_EMOJI = {
     "instagram": "📸",
     "youtube": "▶️",
 }
-
-# YouTube only supports audio download (MP3)
-# TikTok and Instagram support video + audio + both
-YOUTUBE_ONLY_AUDIO = True
 
 
 # ──────────────────────────────────────────────
@@ -190,7 +260,6 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pending_urls[user_id] = url
     emoji = PLATFORM_EMOJI[platform]
 
-    # YouTube only supports audio
     if platform == "youtube":
         keyboard = [
             [InlineKeyboardButton("🎵 Download MP3", callback_data="download_audio")]
@@ -279,7 +348,6 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f".{info.get('ext', 'mp4')}", ".mp4"
                 )
 
-            # Fallback glob
             if not os.path.exists(video_file):
                 matches = glob.glob(os.path.join(DOWNLOAD_DIR, f"{video_id}_video.*"))
                 video_file = matches[0] if matches else None
@@ -344,11 +412,13 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except FileNotFoundError as e:
         logger.error(f"[FILE ERROR] User={user} | {e}", exc_info=True)
-        await query.edit_message_text(f"❌ Failed: {str(e)}")
+        friendly = parse_friendly_error(e, platform)
+        await query.edit_message_text(friendly, parse_mode="Markdown")
 
     except Exception as e:
         logger.error(f"[FAILED] User={user} | platform={platform} | URL={url} | {e}", exc_info=True)
-        await query.edit_message_text(f"❌ Failed to download.\nError: {str(e)}")
+        friendly = parse_friendly_error(e, platform)
+        await query.edit_message_text(friendly, parse_mode="Markdown")
 
     finally:
         cleaned = []
