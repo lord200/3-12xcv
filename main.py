@@ -6,6 +6,7 @@ import logging
 import logging.handlers
 import subprocess
 import urllib.request
+import http.cookiejar
 from datetime import datetime
 
 # Auto-update yt-dlp on every startup
@@ -92,122 +93,222 @@ else:
 pending_urls: dict[int, str] = {}
 pending_info: dict[int, dict] = {}
 
-
 # ──────────────────────────────────────────────
-# TIKTOK PHOTO POST SCRAPER
+# BROWSER HEADERS
 # ──────────────────────────────────────────────
 BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
     "Referer": "https://www.tiktok.com/",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
 }
 
 
-def resolve_redirect(url: str) -> str:
-    """Follow redirects and return the final URL."""
+# ──────────────────────────────────────────────
+# COOKIES HELPER — parse Netscape cookies.txt → requests session
+# ──────────────────────────────────────────────
+def load_cookies_into_session(session: requests.Session, cookies_file: str):
+    """Parse a Netscape cookies.txt file and load into a requests session."""
+    if not cookies_file or not os.path.exists(cookies_file):
+        return
     try:
-        resp = requests.head(url, headers=BROWSER_HEADERS, allow_redirects=True, timeout=10)
-        return resp.url
-    except Exception:
+        with open(cookies_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                if len(parts) < 7:
+                    continue
+                domain, _, path, secure, expires, name, value = parts[:7]
+                cookie = requests.cookies.create_cookie(
+                    name=name,
+                    value=value,
+                    domain=domain.lstrip("."),
+                    path=path,
+                )
+                session.cookies.set_cookie(cookie)
+        logger.debug(f"[COOKIES] Loaded {len(session.cookies)} cookies from {cookies_file}")
+    except Exception as e:
+        logger.warning(f"[COOKIES] Failed to load cookies: {e}")
+
+
+def make_tiktok_session() -> requests.Session:
+    """Create a requests session with TikTok cookies and headers."""
+    session = requests.Session()
+    session.headers.update(BROWSER_HEADERS)
+    load_cookies_into_session(session, TIKTOK_COOKIES_FILE)
+    return session
+
+
+# ──────────────────────────────────────────────
+# TIKTOK PHOTO SCRAPER
+# ──────────────────────────────────────────────
+def resolve_redirect(url: str) -> str:
+    """Follow redirects to get the final URL."""
+    try:
+        session = make_tiktok_session()
+        resp = session.head(url, allow_redirects=True, timeout=10)
+        final = resp.url
+        logger.debug(f"[REDIRECT] {url} → {final}")
+        return final
+    except Exception as e:
+        logger.warning(f"[REDIRECT] Failed: {e}")
         return url
 
 
 def is_tiktok_photo_url(url: str) -> bool:
-    """Check if the URL (after redirect) is a TikTok /photo/ post."""
     return "/photo/" in url
 
 
 def scrape_tiktok_photos(url: str) -> dict:
     """
-    Scrape TikTok photo post page and extract image URLs + metadata.
-    Returns: { "images": [...], "title": "...", "uploader": "...", "video_id": "..." }
+    Scrape TikTok photo post using authenticated session (with cookies).
+    Tries multiple JSON extraction strategies.
     """
-    # Extract video ID from URL
     match = re.search(r"/photo/(\d+)", url)
     video_id = match.group(1) if match else "unknown"
 
-    resp = requests.get(url, headers=BROWSER_HEADERS, timeout=15)
-    html = resp.text
-
-    image_urls = []
-    title = "TikTok Photo Post"
-    uploader = "TikTok"
-
-    # TikTok embeds all page data in a script tag as JSON
-    # Try __UNIVERSAL_DATA_FOR_REHYDRATION__
-    pattern = r'<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>'
-    match = re.search(pattern, html, re.DOTALL)
-    if match:
-        try:
-            data = json.loads(match.group(1))
-            # Navigate the nested structure to find image data
-            default_scope = data.get("__DEFAULT_SCOPE__", {})
-            video_detail = default_scope.get("webapp.video-detail", {})
-            item_info = video_detail.get("itemInfo", {})
-            item_struct = item_info.get("itemStruct", {})
-
-            # Get uploader
-            author = item_struct.get("author", {})
-            uploader = author.get("nickname") or author.get("uniqueId") or "TikTok"
-
-            # Get title/description
-            title = item_struct.get("desc", "TikTok Photo Post") or "TikTok Photo Post"
-
-            # Get images from imagePost
-            image_post = item_struct.get("imagePost", {})
-            images = image_post.get("images", [])
-            for img in images:
-                img_display = img.get("imageURL", {})
-                url_list = img_display.get("urlList", [])
-                if url_list:
-                    image_urls.append(url_list[0])  # Use first/best URL
-
-        except (json.JSONDecodeError, KeyError, TypeError) as e:
-            logger.warning(f"[SCRAPE] Failed to parse __UNIVERSAL_DATA__: {e}")
-
-    # Fallback: try SIGI_STATE
-    if not image_urls:
-        pattern2 = r'<script id="SIGI_STATE"[^>]*>(.*?)</script>'
-        match2 = re.search(pattern2, html, re.DOTALL)
-        if match2:
-            try:
-                data2 = json.loads(match2.group(1))
-                item_module = data2.get("ItemModule", {})
-                for item_id, item in item_module.items():
-                    image_post = item.get("imagePost", {})
-                    images = image_post.get("images", [])
-                    for img in images:
-                        url_list = img.get("imageURL", {}).get("urlList", [])
-                        if url_list:
-                            image_urls.append(url_list[0])
-                    if images:
-                        title = item.get("desc", title)
-                        uploader = item.get("author", uploader)
-                        break
-            except (json.JSONDecodeError, KeyError, TypeError) as e:
-                logger.warning(f"[SCRAPE] Failed to parse SIGI_STATE: {e}")
-
-    return {
-        "images": image_urls,
-        "title": title,
-        "uploader": uploader,
+    result = {
+        "images": [],
+        "title": "TikTok Photo Post",
+        "uploader": "TikTok",
         "video_id": video_id,
     }
 
+    session = make_tiktok_session()
+
+    try:
+        resp = session.get(url, timeout=15, allow_redirects=True)
+        html = resp.text
+        logger.debug(f"[SCRAPE] Page fetched | status={resp.status_code} | size={len(html)} chars")
+
+        # ── Strategy 1: __UNIVERSAL_DATA_FOR_REHYDRATION__ ──
+        match1 = re.search(
+            r'<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>',
+            html, re.DOTALL
+        )
+        if match1:
+            try:
+                data = json.loads(match1.group(1))
+                scope = data.get("__DEFAULT_SCOPE__", {})
+                item_struct = (
+                    scope.get("webapp.video-detail", {})
+                         .get("itemInfo", {})
+                         .get("itemStruct", {})
+                )
+                _extract_from_item_struct(item_struct, result)
+                if result["images"]:
+                    logger.info(f"[SCRAPE] Strategy 1 success | photos={len(result['images'])}")
+                    return result
+            except Exception as e:
+                logger.debug(f"[SCRAPE] Strategy 1 failed: {e}")
+
+        # ── Strategy 2: SIGI_STATE ──
+        match2 = re.search(
+            r'<script id="SIGI_STATE"[^>]*>(.*?)</script>',
+            html, re.DOTALL
+        )
+        if match2:
+            try:
+                data2 = json.loads(match2.group(1))
+                for item_id, item in data2.get("ItemModule", {}).items():
+                    _extract_from_item_struct(item, result)
+                    if result["images"]:
+                        logger.info(f"[SCRAPE] Strategy 2 success | photos={len(result['images'])}")
+                        return result
+            except Exception as e:
+                logger.debug(f"[SCRAPE] Strategy 2 failed: {e}")
+
+        # ── Strategy 3: Generic JSON search for imagePost ──
+        all_json_blocks = re.findall(r'\{[^{}]*"imagePost"[^{}]*\}', html)
+        for block in all_json_blocks:
+            try:
+                data3 = json.loads(block)
+                images = data3.get("imagePost", {}).get("images", [])
+                for img in images:
+                    url_list = img.get("imageURL", {}).get("urlList", [])
+                    if url_list:
+                        result["images"].append(url_list[0])
+                if result["images"]:
+                    logger.info(f"[SCRAPE] Strategy 3 success | photos={len(result['images'])}")
+                    return result
+            except Exception:
+                continue
+
+        # ── Strategy 4: TikTok API with video ID ──
+        if video_id != "unknown":
+            api_result = _try_tiktok_api(video_id, session)
+            if api_result["images"]:
+                logger.info(f"[SCRAPE] Strategy 4 (API) success | photos={len(api_result['images'])}")
+                return api_result
+
+        logger.warning(f"[SCRAPE] All strategies failed for video_id={video_id}")
+        # Log a snippet of the HTML to help debug
+        logger.debug(f"[SCRAPE] HTML snippet: {html[:500]}")
+
+    except Exception as e:
+        logger.error(f"[SCRAPE] Request failed: {e}", exc_info=True)
+
+    return result
+
+
+def _extract_from_item_struct(item: dict, result: dict):
+    """Extract images, title, uploader from a TikTok itemStruct dict."""
+    if not item:
+        return
+
+    author = item.get("author", {})
+    if isinstance(author, dict):
+        result["uploader"] = author.get("nickname") or author.get("uniqueId") or result["uploader"]
+    elif isinstance(author, str):
+        result["uploader"] = author
+
+    result["title"] = item.get("desc") or result["title"]
+
+    image_post = item.get("imagePost", {})
+    images = image_post.get("images", [])
+    for img in images:
+        if isinstance(img, dict):
+            url_list = img.get("imageURL", {}).get("urlList", [])
+            if url_list:
+                result["images"].append(url_list[0])
+
+
+def _try_tiktok_api(video_id: str, session: requests.Session) -> dict:
+    """Try TikTok's internal API endpoint to get photo data."""
+    result = {"images": [], "title": "TikTok Photo Post", "uploader": "TikTok", "video_id": video_id}
+    try:
+        api_url = f"https://www.tiktok.com/api/item/detail/?itemId={video_id}&aid=1988"
+        resp = session.get(api_url, timeout=10)
+        data = resp.json()
+        item = data.get("itemInfo", {}).get("itemStruct", {})
+        _extract_from_item_struct(item, result)
+    except Exception as e:
+        logger.debug(f"[API] TikTok API attempt failed: {e}")
+    return result
+
 
 def download_photos_to_disk(image_urls: list, video_id: str) -> list:
-    """Download image URLs to disk and return list of local file paths."""
+    """Download photos using authenticated session."""
     photo_dir = os.path.join(DOWNLOAD_DIR, video_id)
     os.makedirs(photo_dir, exist_ok=True)
 
+    session = make_tiktok_session()
     paths = []
+
     for i, img_url in enumerate(image_urls):
         dest = os.path.join(photo_dir, f"{i+1:03d}.jpg")
         try:
-            req = urllib.request.Request(img_url, headers=BROWSER_HEADERS)
-            with urllib.request.urlopen(req, timeout=15) as response:
-                with open(dest, "wb") as f:
-                    f.write(response.read())
+            resp = session.get(img_url, timeout=15, stream=True)
+            resp.raise_for_status()
+            with open(dest, "wb") as f:
+                for chunk in resp.iter_content(8192):
+                    f.write(chunk)
             paths.append(dest)
             logger.debug(f"[PHOTO] Downloaded {i+1}/{len(image_urls)}")
         except Exception as e:
@@ -221,7 +322,6 @@ def download_photos_to_disk(image_urls: list, video_id: str) -> list:
 # ──────────────────────────────────────────────
 def parse_friendly_error(error: Exception, platform: str) -> str:
     msg = str(error).lower()
-
     if any(k in msg for k in ["private", "login", "log in", "authentication",
                                "not comfortable", "this post may not be", "sign in"]):
         return "🔒 This content is *private* or requires a login.\n\nMake sure your cookies are up to date."
@@ -234,10 +334,7 @@ def parse_friendly_error(error: Exception, platform: str) -> str:
     if any(k in msg for k in ["age", "18+", "adult", "mature"]):
         return "🔞 This content is *age-restricted*.\n\nAdd your cookies to access it."
     if any(k in msg for k in ["no video formats", "no formats found", "unsupported url"]):
-        return (
-            "📭 This content format is not supported or no downloadable formats were found.\n\n"
-            "The content may be private, deleted, or temporarily blocked."
-        )
+        return "📭 No downloadable formats found.\n\nThe content may be private, deleted, or temporarily blocked."
     if any(k in msg for k in ["too large", "file size", "maximum"]):
         return "📦 This file is *too large* to send via Telegram (50MB limit)."
     if any(k in msg for k in ["timeout", "connection", "network", "ssl", "http error"]):
@@ -251,7 +348,6 @@ def parse_friendly_error(error: Exception, platform: str) -> str:
             return "🎬 This is a *Premiere* that hasn't aired yet."
     if platform == "instagram" and "story" in msg:
         return "📖 Instagram *Stories* are not supported."
-
     return (
         f"❌ Failed to download this {platform.capitalize()} content.\n\n"
         "The content may be private, deleted, or temporarily unavailable."
@@ -331,24 +427,23 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.chat.send_action(ChatAction.TYPING)
 
     try:
-        # ── Resolve redirect to detect /photo/ URLs before calling yt-dlp ──
         resolved_url = resolve_redirect(url)
-        logger.debug(f"[REDIRECT] {url} → {resolved_url}")
 
-        # ── TikTok photo post — bypass yt-dlp entirely ──
+        # ── TikTok photo post ──
         if platform == "tiktok" and is_tiktok_photo_url(resolved_url):
-            logger.info(f"[PHOTO POST] Detected TikTok photo URL | user={user}")
+            logger.info(f"[PHOTO POST] TikTok photo URL detected | user={user}")
             photo_data = scrape_tiktok_photos(resolved_url)
             photo_count = len(photo_data["images"])
 
             if photo_count == 0:
                 await update.message.reply_text(
-                    "😕 Couldn't extract photos from this TikTok post.\n"
-                    "The post may be private or the format is not supported."
+                    "😕 Couldn't extract photos from this TikTok post.\n\n"
+                    "This usually means your *TikTok cookies* are expired or missing.\n"
+                    "Please update the `TIKTOK_COOKIES` variable in Railway and redeploy.",
+                    parse_mode="Markdown"
                 )
                 return
 
-            # Store scraped data for callback
             pending_urls[user_id] = resolved_url
             pending_info[user_id] = {
                 "type": "tiktok_photo",
@@ -445,7 +540,6 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     title = cached.get("title", "Unknown")
     uploader = cached.get("uploader") or cached.get("channel") or platform.capitalize()
     duration_sec = cached.get("duration", 0)
-
     start_time = datetime.now()
 
     try:
@@ -475,17 +569,15 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 }
                 with yt_dlp.YoutubeDL(audio_opts) as ydl:
                     ydl.extract_info(url, download=True)
-
                 matches = glob.glob(os.path.join(DOWNLOAD_DIR, f"{video_id}_audio.*"))
                 audio_file = next((f for f in matches if f.endswith(".mp3")), None)
                 if not audio_file:
                     raise FileNotFoundError("MP3 not found after conversion.")
-
-                logger.info(f"[AUDIO OK] size={os.path.getsize(audio_file)/(1024*1024):.2f}MB | user={user}")
+                logger.info(f"[AUDIO OK] size={os.path.getsize(audio_file)/(1024*1024):.2f}MB")
 
         # ── NORMAL VIDEO/AUDIO ──
         else:
-            info = cached  # full yt-dlp info dict
+            info = cached
 
             if choice in ("download_video", "download_both"):
                 if platform == "youtube":
@@ -504,15 +596,12 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     video_file = ydl.prepare_filename(info).replace(
                         f".{info.get('ext', 'mp4')}", ".mp4"
                     )
-
                 if not os.path.exists(video_file):
                     matches = glob.glob(os.path.join(DOWNLOAD_DIR, f"{video_id}_video.*"))
                     video_file = matches[0] if matches else None
-
                 if not video_file or not os.path.exists(video_file):
                     raise FileNotFoundError("Video file not found after download.")
-
-                logger.info(f"[VIDEO OK] size={os.path.getsize(video_file)/(1024*1024):.2f}MB | user={user}")
+                logger.info(f"[VIDEO OK] size={os.path.getsize(video_file)/(1024*1024):.2f}MB")
 
             if choice in ("download_audio", "download_both"):
                 logger.debug(f"[DOWNLOAD] Audio | id={video_id} | user={user}")
@@ -528,13 +617,11 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 }
                 with yt_dlp.YoutubeDL(audio_opts) as ydl:
                     ydl.extract_info(url, download=True)
-
                 matches = glob.glob(os.path.join(DOWNLOAD_DIR, f"{video_id}_audio.*"))
                 audio_file = next((f for f in matches if f.endswith(".mp3")), None)
                 if not audio_file:
                     raise FileNotFoundError("MP3 not found after conversion.")
-
-                logger.info(f"[AUDIO OK] size={os.path.getsize(audio_file)/(1024*1024):.2f}MB | user={user}")
+                logger.info(f"[AUDIO OK] size={os.path.getsize(audio_file)/(1024*1024):.2f}MB")
 
         await query.edit_message_text("✅ Done! Sending your file(s)...")
 
@@ -588,7 +675,6 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for f in [video_file, audio_file]:
             if f and os.path.exists(f):
                 os.remove(f)
-
         if photo_files:
             photo_dir = os.path.join(DOWNLOAD_DIR, video_id)
             for f in photo_files:
@@ -598,7 +684,6 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 os.rmdir(photo_dir)
             except OSError:
                 pass
-
         logger.debug(f"[CLEANUP] Done for id={video_id}")
 
 
